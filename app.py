@@ -1,5 +1,5 @@
 import streamlit as st
-from notion_client import Client
+import requests
 import google.generativeai as genai
 from datetime import datetime
 import json
@@ -54,31 +54,30 @@ def fmt_date(iso_str):
     except Exception:
         return iso_str[:10]
 
-# ── APIクライアント ──────────────────────────────────────────────────────────
-@st.cache_resource
-def get_notion():
-    return Client(auth=st.secrets["NOTION_TOKEN"])
+# ── Notion API 直接呼び出し ──────────────────────────────────────────────────
+NOTION_API = "https://api.notion.com/v1"
+NOTION_VER  = "2022-06-28"
 
-@st.cache_resource
-def get_model():
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model_name = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
-    return genai.GenerativeModel(model_name)
+def notion_headers():
+    return {
+        "Authorization":  f"Bearer {st.secrets['NOTION_TOKEN']}",
+        "Content-Type":   "application/json",
+        "Notion-Version": NOTION_VER,
+    }
 
-# ── Notion ヘルパー ──────────────────────────────────────────────────────────
 def _rt(text: str):
-    """rich_text プロパティ用ヘルパー"""
-    return [{"text": {"content": text[:2000]}}]  # Notion上限
+    return [{"text": {"content": text[:2000]}}]
 
 def fetch_entries():
-    notion = get_notion()
     db_id = st.secrets["NOTION_DB_ID"]
-    results = notion.databases.query(
-        database_id=db_id,
-        sorts=[{"property": "日付", "direction": "descending"}],
+    resp = requests.post(
+        f"{NOTION_API}/databases/{db_id}/query",
+        headers=notion_headers(),
+        json={"sorts": [{"property": "日付", "direction": "descending"}]},
     )
+    resp.raise_for_status()
     entries = []
-    for page in results["results"]:
+    for page in resp.json()["results"]:
         p = page["properties"]
 
         def get_rt(key):
@@ -86,42 +85,54 @@ def fetch_entries():
             return arr[0]["text"]["content"] if arr else ""
 
         entries.append({
-            "id": page["id"],
-            "date": (p.get("日付", {}).get("date") or {}).get("start", ""),
-            "author": (p.get("作者", {}).get("select") or {}).get("name", ""),
-            "mood": get_rt("気持ち"),
-            "text": get_rt("内容"),
+            "id":             page["id"],
+            "date":           (p.get("日付", {}).get("date") or {}).get("start", ""),
+            "author":         (p.get("作者", {}).get("select") or {}).get("name", ""),
+            "mood":           get_rt("気持ち"),
+            "text":           get_rt("内容"),
             "parent_comment": get_rt("親のコメント"),
-            "stamps": json.loads(get_rt("スタンプ") or "[]"),
+            "stamps":         json.loads(get_rt("スタンプ") or "[]"),
         })
     return entries
 
 def add_entry(author: str, mood: str, text: str):
-    notion = get_notion()
     db_id = st.secrets["NOTION_DB_ID"]
-    now = datetime.now()
-    notion.pages.create(
-        parent={"database_id": db_id},
-        properties={
-            "名前":       {"title":     _rt(f"{now.strftime('%Y/%m/%d')} {author}")},
-            "日付":       {"date":      {"start": now.isoformat()}},
-            "作者":       {"select":    {"name": author}},
-            "気持ち":     {"rich_text": _rt(mood)},
-            "内容":       {"rich_text": _rt(text)},
-            "親のコメント": {"rich_text": _rt("")},
-            "スタンプ":   {"rich_text": _rt("[]")},
+    now   = datetime.now()
+    requests.post(
+        f"{NOTION_API}/pages",
+        headers=notion_headers(),
+        json={
+            "parent": {"database_id": db_id},
+            "properties": {
+                "名前":         {"title":     _rt(f"{now.strftime('%Y/%m/%d')} {author}")},
+                "日付":         {"date":      {"start": now.isoformat()}},
+                "作者":         {"select":    {"name": author}},
+                "気持ち":       {"rich_text": _rt(mood)},
+                "内容":         {"rich_text": _rt(text)},
+                "親のコメント": {"rich_text": _rt("")},
+                "スタンプ":     {"rich_text": _rt("[]")},
+            },
         },
-    )
+    ).raise_for_status()
 
 def save_reply(page_id: str, comment: str, stamps: list):
-    notion = get_notion()
-    notion.pages.update(
-        page_id=page_id,
-        properties={
-            "親のコメント": {"rich_text": _rt(comment)},
-            "スタンプ":    {"rich_text": _rt(json.dumps(stamps, ensure_ascii=False))},
+    requests.patch(
+        f"{NOTION_API}/pages/{page_id}",
+        headers=notion_headers(),
+        json={
+            "properties": {
+                "親のコメント": {"rich_text": _rt(comment)},
+                "スタンプ":     {"rich_text": _rt(json.dumps(stamps, ensure_ascii=False))},
+            }
         },
-    )
+    ).raise_for_status()
+
+# ── Gemini ───────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_model():
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model_name = st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+    return genai.GenerativeModel(model_name)
 
 # ── セッション状態の初期化 ────────────────────────────────────────────────
 _defaults = {
